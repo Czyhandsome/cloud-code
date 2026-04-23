@@ -255,6 +255,7 @@ import {
   type RetryContext,
   withRetry,
 } from './withRetry.js'
+import { getNarrativeLogger } from '../../utils/narrativeSession.js'
 
 // Define a type that represents valid JSON values
 type JsonValue = string | number | boolean | null | JsonObject | JsonArray
@@ -1796,6 +1797,7 @@ async function* queryModel(
 
         const params = paramsFromContext(context)
         captureAPIRequest(params, options.querySource) // Capture for bug reports
+        getNarrativeLogger()?.writeRawAPIRequest(params) // Narrative: raw wire-format req
 
         maxOutputTokens = params.max_tokens
 
@@ -2885,6 +2887,14 @@ async function* queryModel(
       previousRequestId,
       betas: lastRequestBetas,
     })
+  })
+
+  // Narrative: log raw API response metadata for source-of-truth comparison
+  getNarrativeLogger()?.writeRawAPIResponse({
+    stopReason: stopReason ?? null,
+    usage,
+    requestId: streamRequestId ?? null,
+    model: newMessages[0]?.message.model ?? options.model,
   })
 
   // Defensive: also release on normal completion (no-op if finally already ran).

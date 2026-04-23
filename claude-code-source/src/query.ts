@@ -110,6 +110,7 @@ import {
 } from './bootstrap/state.js'
 import { createBudgetTracker, checkTokenBudget } from './query/tokenBudget.js'
 import { count } from './utils/array.js'
+import { getNarrativeLogger } from './utils/narrativeSession.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const snipModule = feature('HISTORY_SNIP')
@@ -294,6 +295,21 @@ async function* queryLoop(
   // for what's included and why feature() gates are intentionally excluded.
   const config = buildQueryConfig()
 
+  // Narrative logging — initialized once per turn (one queryLoop call = one user turn)
+  let narrativeRound = 0
+  let narrativeRoundStart = 0
+  const narrativeLogger = getNarrativeLogger(systemPrompt.join('\n'))
+  {
+    const lastUserMsg = params.messages.findLast(m => m.type === 'user')
+    const promptParts = lastUserMsg?.type === 'user' ? lastUserMsg.message.content : []
+    const promptText = Array.isArray(promptParts)
+      ? promptParts.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map(b => b.text).join('\n')
+      : ''
+    narrativeLogger?.startTurn(config.sessionId, promptText, {
+      inheritedMessageCount: params.messages.length,
+    })
+  }
+
   // Fired once per user turn — the prompt is invariant across loop iterations,
   // so per-iteration firing would ask sideQuery the same question N times.
   // Consume point polls settledAt (never blocks). `using` disposes on all
@@ -305,6 +321,9 @@ async function* queryLoop(
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    narrativeRound++
+    narrativeRoundStart = Date.now()
+
     // Destructure state at the top of each iteration. toolUseContext alone
     // is reassigned within an iteration (queryTracking, messages updates);
     // the rest are read-only between continue sites.
@@ -643,6 +662,7 @@ async function* queryLoop(
           content: PROMPT_TOO_LONG_ERROR_MESSAGE,
           error: 'invalid_request',
         })
+        narrativeLogger?.finishTurn('blocking_limit', 'Hit token blocking limit')
         return { reason: 'blocking_limit' }
       }
     }
@@ -655,6 +675,12 @@ async function* queryLoop(
         attemptWithFallback = false
         try {
           let streamingFallbackOccured = false
+          narrativeLogger?.logModelRequest(narrativeRound, {
+            systemPrompt: fullSystemPrompt.join('\n'),
+            model: currentModel,
+            messages: prependUserContext(messagesForQuery, userContext),
+            toolNames: toolUseContext.options.tools.map(t => t.name),
+          })
           queryCheckpoint('query_api_streaming_start')
           for await (const message of deps.callModel({
             messages: prependUserContext(messagesForQuery, userContext),
@@ -862,6 +888,18 @@ async function* queryLoop(
             }
           }
           queryCheckpoint('query_api_streaming_end')
+          {
+            const assistantText = assistantMessages
+              .flatMap(m => m.message.content)
+              .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+              .map(b => b.text)
+              .join('\n')
+            const toolCallsForLog = toolUseBlocks.map(b => ({
+              name: b.name,
+              kind: (toolUseContext.options.tools.find(t => t.name === b.name)?.isReadOnly(b.input) ? 'read' : 'mutating') as 'read' | 'mutating',
+            }))
+            narrativeLogger?.logModelRound(narrativeRound, assistantText, toolCallsForLog, Date.now() - narrativeRoundStart)
+          }
 
           // Yield deferred microcompact boundary message using actual API-reported
           // token deletion count instead of client-side estimates.
@@ -974,6 +1012,7 @@ async function* queryLoop(
         yield createAssistantAPIErrorMessage({
           content: error.message,
         })
+        narrativeLogger?.finishTurn('image_error', error.message)
         return { reason: 'image_error' }
       }
 
@@ -993,6 +1032,7 @@ async function* queryLoop(
 
       // To help track down bugs, log loudly for ants
       logAntError('Query error', error)
+      narrativeLogger?.finishTurn('model_error', errorMessage)
       return { reason: 'model_error', error }
     }
 
@@ -1048,6 +1088,7 @@ async function* queryLoop(
           toolUse: false,
         })
       }
+      narrativeLogger?.finishTurn('interrupted', 'Streaming aborted')
       return { reason: 'aborted_streaming' }
     }
 
@@ -1172,6 +1213,7 @@ async function* queryLoop(
         // → retry → error → … (the hook injects more tokens each cycle).
         yield lastMessage
         void executeStopFailureHooks(lastMessage, toolUseContext)
+        narrativeLogger?.finishTurn(isWithheldMedia ? 'image_error' : 'prompt_too_long', '')
         return { reason: isWithheldMedia ? 'image_error' : 'prompt_too_long' }
       } else if (feature('CONTEXT_COLLAPSE') && isWithheld413) {
         // reactiveCompact compiled out but contextCollapse withheld and
@@ -1179,6 +1221,7 @@ async function* queryLoop(
         // early-return rationale — don't fall through to stop hooks.
         yield lastMessage
         void executeStopFailureHooks(lastMessage, toolUseContext)
+        narrativeLogger?.finishTurn('prompt_too_long', '')
         return { reason: 'prompt_too_long' }
       }
 
@@ -1261,6 +1304,7 @@ async function* queryLoop(
       // error → hook blocking → retry → error → …
       if (lastMessage?.isApiErrorMessage) {
         void executeStopFailureHooks(lastMessage, toolUseContext)
+        narrativeLogger?.finishTurn('completed', 'API error — turn ended')
         return { reason: 'completed' }
       }
 
@@ -1276,6 +1320,7 @@ async function* queryLoop(
       )
 
       if (stopHookResult.preventContinuation) {
+        narrativeLogger?.finishTurn('stop_hook_prevented', 'Stop hook prevented continuation')
         return { reason: 'stop_hook_prevented' }
       }
 
@@ -1354,6 +1399,7 @@ async function* queryLoop(
         }
       }
 
+      narrativeLogger?.finishTurn('completed', '')
       return { reason: 'completed' }
     }
 
@@ -1390,6 +1436,32 @@ async function* queryLoop(
           update.message.attachment.type === 'hook_stopped_continuation'
         ) {
           shouldPreventContinuation = true
+        }
+
+        // Log each tool result for the narrative
+        if (narrativeLogger && update.message.type === 'user') {
+          for (const block of update.message.message.content) {
+            if (block.type === 'tool_result') {
+              const toolUseBlock = toolUseBlocks.find(b => b.id === block.tool_use_id)
+              if (toolUseBlock) {
+                const tool = toolUseContext.options.tools.find(t => t.name === toolUseBlock.name)
+                const kind = tool?.isReadOnly(toolUseBlock.input) ? 'read' : 'mutating'
+                const outputText = typeof block.content === 'string'
+                  ? block.content
+                  : Array.isArray(block.content)
+                    ? block.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map(c => c.text).join('\n')
+                    : ''
+                narrativeLogger.logToolResult(
+                  toolUseBlock.name,
+                  kind as 'read' | 'mutating',
+                  !block.is_error,
+                  outputText,
+                  0,
+                  block.is_error ? outputText : undefined,
+                )
+              }
+            }
+          }
         }
 
         toolResults.push(
@@ -1512,11 +1584,13 @@ async function* queryLoop(
           turnCount: nextTurnCountOnAbort,
         })
       }
+      narrativeLogger?.finishTurn('interrupted', 'Tool execution aborted')
       return { reason: 'aborted_tools' }
     }
 
     // If a hook indicated to prevent continuation, stop here
     if (shouldPreventContinuation) {
+      narrativeLogger?.finishTurn('stop_hook_prevented', 'Hook stopped continuation')
       return { reason: 'hook_stopped' }
     }
 
@@ -1708,6 +1782,7 @@ async function* queryLoop(
         maxTurns,
         turnCount: nextTurnCount,
       })
+      narrativeLogger?.finishTurn('completed', `Max turns (${maxTurns}) reached`)
       return { reason: 'max_turns', turnCount: nextTurnCount }
     }
 
