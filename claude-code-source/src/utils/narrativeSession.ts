@@ -24,7 +24,7 @@ export function getNarrativeLogger(systemPrompt?: string): NarrativeLogger | nul
     .slice(0, 15) // YYYYMMDD-HHmmss
   const sessionDir = join(
     homedir(),
-    '.claude',
+    '.claude2',
     'narrative-logs',
     workspaceHash,
     `${ts}-${sessionId.slice(0, 8)}`,
