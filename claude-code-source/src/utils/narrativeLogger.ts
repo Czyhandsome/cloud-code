@@ -120,9 +120,16 @@ function stopReasonText(stopReason: NarrativeStopReason): string {
   }
 }
 
+function fenceFor(text: string): string {
+  const runs = text.match(/`+/g) ?? []
+  const longest = runs.reduce((m, s) => Math.max(m, s.length), 0)
+  return '`'.repeat(Math.max(3, longest + 1))
+}
+
 function formatTextBlock(text: string): string {
   const normalized = text.length > 0 ? text : '[empty]'
-  return ['```text', normalized, '```'].join('\n')
+  const fence = fenceFor(normalized)
+  return [`${fence}text`, normalized, fence].join('\n')
 }
 
 function readTurnNumber(turnsDir: string): number {
