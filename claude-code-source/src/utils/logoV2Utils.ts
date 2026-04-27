@@ -4,6 +4,7 @@ import type { LogOption } from '../types/logs.js'
 import { getSubscriptionName, isClaudeAISubscriber } from './auth.js'
 import { getCwd } from './cwd.js'
 import { getDisplayPath } from './file.js'
+import { getNarrativeDir } from './narrativeSession.js'
 import {
   truncate,
   truncateToWidth,
@@ -244,6 +245,7 @@ export function getLogoDisplayData(): {
   cwd: string
   billingType: string
   agentName: string | undefined
+  narrativeDir: string | null
 } {
   const version = process.env.DEMO_VERSION ?? MACRO.VERSION
   const serverUrl = getDirectConnectServerUrl()
@@ -263,6 +265,7 @@ export function getLogoDisplayData(): {
     cwd,
     billingType,
     agentName,
+    narrativeDir: getNarrativeDir(),
   }
 }
 
